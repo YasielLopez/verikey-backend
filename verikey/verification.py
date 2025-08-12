@@ -1,93 +1,187 @@
 from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 import re
-from verikey import db
-from verikey.models import User, Request, Verification
-from verikey.auth import token_required
+import uuid
+from verikey.models import db
+from verikey.models import User, Request, ShareableKey 
+from verikey.decorators import token_required
+from datetime import datetime
+import json
 
-# Create blueprint
 verification_bp = Blueprint('verification', __name__)
 
-def validate_email(email):
-    """Validate email format"""
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(pattern, email) is not None
+def validate_title(title: str) -> tuple[bool, str]:
+    if not title or not title.strip():
+        return False, "Title is required"
+    
+    title = title.strip()
+    
+    MIN_LENGTH = 3
+    MAX_LENGTH = 30
+    
+    if len(title) < MIN_LENGTH:
+        return False, f"Title must be at least {MIN_LENGTH} characters"
+    
+    if len(title) > MAX_LENGTH:
+        return False, f"Title must be no more than {MAX_LENGTH} characters"
+    
+    words = title.split()
+    if len(words) == 1 and len(title) > 20:
+        return False, "Title appears to be a single long word. Please use a descriptive title"
+    
+    MAX_WORD_LENGTH = 15
+    for word in words:
+        if len(word) > MAX_WORD_LENGTH:
+            return False, f"Individual words in title cannot exceed {MAX_WORD_LENGTH} characters"
+    
+    if not any(c.isalpha() for c in title):
+        return False, "Title must contain at least some letters"
+    
+    return True, ""
 
-def validate_coordinates(latitude, longitude):
-    """Validate latitude and longitude values"""
+@verification_bp.route('/requests', methods=['GET'])
+@token_required
+def get_requests(current_user_id):
     try:
-        lat = float(latitude)
-        lng = float(longitude)
-        return (-90 <= lat <= 90) and (-180 <= lng <= 180)
-    except (ValueError, TypeError):
-        return False
+        current_user = User.query.get(current_user_id)
+        if not current_user:
+            return {'error': 'User not found'}, 404
+        
+        sent_requests = Request.query.filter_by(
+            requester_id=current_user_id
+        ).order_by(Request.created_at.desc()).all()
+        
+        received_requests = Request.query.filter_by(
+            target_email=current_user.email
+        ).order_by(Request.created_at.desc()).all()
+        
+        sent_requests_ui = []
+        for req in sent_requests:
+            if req.status == 'completed':
+                continue
+                
+            target_user = User.query.get(req.target_user_id) if req.target_user_id else None
+            
+            if target_user and target_user.screen_name:
+                target_name = f"@{target_user.screen_name}"
+            elif target_user and target_user.first_name:
+                target_name = f"{target_user.first_name} {target_user.last_name or ''}".strip()
+            elif req.target_email and not req.target_email.startswith('shareable-'):
+                target_name = req.target_email
+            elif req.target_email and req.target_email.startswith('shareable-'):
+                target_name = 'Shareable Link'
+            else:
+                target_name = 'Unknown'
+            
+            sent_requests_ui.append({
+                'id': req.id,
+                'title': req.label,
+                'status': req.status,
+                'sentTo': target_name,
+                'sentOn': req.created_at.isoformat() if req.created_at else 'Unknown',
+                'informationTypes': req.get_information_types(),
+                'notes': req.notes or '',
+                'type': 'sent'
+            })
+        
+        received_requests_ui = []
+        for req in received_requests:
+            if req.status == 'completed':
+                continue
+                
+            requester = User.query.get(req.requester_id)
+            
+            if requester and requester.screen_name:
+                requester_name = f"@{requester.screen_name}"
+            elif requester and requester.first_name:
+                requester_name = f"{requester.first_name} {requester.last_name or ''}".strip()
+            elif requester:
+                requester_name = requester.email
+            else:
+                requester_name = 'Unknown'
+            
+            received_requests_ui.append({
+                'id': req.id,
+                'title': req.label,
+                'status': req.status,
+                'from': requester_name,
+                'receivedOn': req.created_at.isoformat() if req.created_at else 'Unknown',
+                'informationTypes': req.get_information_types(),
+                'notes': req.notes or '',
+                'type': 'received'
+            })
+        
+        current_app.logger.info(f"✅ Retrieved {len(received_requests_ui)} received and {len(sent_requests_ui)} sent requests for user {current_user_id}")
+        
+        return {
+            'received': received_requests_ui,
+            'sent': sent_requests_ui,
+            'received_requests': received_requests_ui,
+            'sent_requests': sent_requests_ui
+        }, 200
+        
+    except Exception as e:
+        current_app.logger.error(f"❌ Failed to get requests for user {current_user_id}: {str(e)}")
+        return {'error': 'Failed to get requests'}, 500
 
 @verification_bp.route('/requests', methods=['POST'])
 @token_required
 def create_request(current_user_id):
-    """Create a new verification request (JWT protected)"""
     try:
-        # Validate request has JSON data
-        if not request.is_json:
-            current_app.logger.warning(f"Request creation attempt without JSON data by user {current_user_id}")
-            return {'error': 'Request must be JSON'}, 400
-        
         data = request.get_json()
+        current_app.logger.info(f"🚀 Creating request with data: {data}")
         
-        # Validate required fields
-        if not data:
-            return {'error': 'No data provided'}, 400
+        if not data.get('label'):
+            return {'error': 'Title is required'}, 400
         
-        # Note: requester_id comes from JWT token, not request body
-        target_email = data.get('target_email', '').strip().lower()
+        is_valid, error_message = validate_title(data.get('label', ''))
+        if not is_valid:
+            return {'error': error_message}, 400
         
-        if not target_email:
-            current_app.logger.warning(f"Request creation with missing target_email by user {current_user_id}")
+        cleaned_title = data['label'].strip()
+        
+        if not data.get('target_email'):
             return {'error': 'Target email is required'}, 400
+        if not data.get('information_types'):
+            return {'error': 'Information types are required'}, 400
         
-        # Validate email format
-        if not validate_email(target_email):
-            current_app.logger.warning(f"Request creation with invalid email: {target_email} by user {current_user_id}")
-            return {'error': 'Invalid email format'}, 400
+        target_user = None
+        target_identifier = data['target_email'].strip()
         
-        # Get current user info
-        requester = User.query.get(current_user_id)
-        if not requester:
-            current_app.logger.error(f"Token valid but user {current_user_id} not found in create_request")
-            return {'error': 'User not found'}, 404
+        target_user = User.query.filter_by(email=target_identifier).first()
         
-        # Check if requester is requesting from themselves
-        if requester.email == target_email:
-            current_app.logger.warning(f"User {requester.email} tried to request verification from themselves")
-            return {'error': 'Cannot request verification from yourself'}, 400
+        if not target_user:
+            clean_identifier = target_identifier.lstrip('@').lower()
+            target_user = User.query.filter_by(screen_name=clean_identifier).first()
         
-        # Check for duplicate pending requests
-        existing_request = Request.query.filter_by(
-            requester_id=current_user_id,
-            target_email=target_email,
-            status='pending'
-        ).first()
-        
-        if existing_request:
-            current_app.logger.warning(f"Duplicate request attempted: user {current_user_id} to {target_email}")
-            return {'error': 'You already have a pending request to this email'}, 409
-        
-        # Create new request (requester_id comes from JWT token)
         new_request = Request(
+            label=cleaned_title,
             requester_id=current_user_id,
-            target_email=target_email,
+            target_email=target_user.email if target_user else target_identifier,
+            target_user_id=target_user.id if target_user else None,
+            notes=data.get('notes', ''),
             status='pending'
         )
+        
+        if isinstance(data['information_types'], list):
+            new_request.set_information_types(data['information_types'])
+        else:
+            return {'error': 'Information types must be a list'}, 400
+        
         db.session.add(new_request)
         db.session.commit()
         
-        current_app.logger.info(f"✅ New verification request created: ID {new_request.id}, from user {current_user_id} to {target_email}")
+        current_app.logger.info(f"✅ Created verification request: {new_request.id} from user {current_user_id} to {new_request.target_email}")
+        current_app.logger.info(f"🎯 Target user ID: {new_request.target_user_id}")
         
         return {
             'message': 'Verification request created successfully',
+            'request_id': new_request.id,
             'request': {
                 'id': new_request.id,
+                'label': new_request.label,
                 'target_email': new_request.target_email,
+                'target_user_id': new_request.target_user_id,
                 'status': new_request.status,
                 'created_at': new_request.created_at.isoformat()
             }
@@ -95,205 +189,227 @@ def create_request(current_user_id):
         
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"Request creation failed for user {current_user_id}: {str(e)}")
-        return {'error': 'Failed to create verification request. Please try again.'}, 500
+        current_app.logger.error(f"❌ Failed to create request: {str(e)}")
+        return {'error': 'Failed to create request'}, 500
 
-@verification_bp.route('/requests', methods=['GET'])
+@verification_bp.route('/requests/<int:request_id>', methods=['DELETE'])
 @token_required
-def list_requests(current_user_id):
-    """List user's sent and received verification requests (JWT protected)"""
+def delete_request(current_user_id, request_id):
     try:
-        # Get current user info
-        user = User.query.get(current_user_id)
-        if not user:
-            current_app.logger.error(f"Token valid but user {current_user_id} not found in list_requests")
-            return {'error': 'User not found'}, 404
-        
-        # Get sent requests (requests this user made)
-        sent_requests = Request.query.filter_by(requester_id=current_user_id).order_by(Request.created_at.desc()).all()
-        sent_list = [{
-            'id': req.id,
-            'target_email': req.target_email,
-            'status': req.status,
-            'created_at': req.created_at.isoformat(),
-            'type': 'sent'
-        } for req in sent_requests]
-        
-        # Get received requests (requests sent to this user's email)
-        received_requests = Request.query.filter_by(target_email=user.email).order_by(Request.created_at.desc()).all()
-        received_list = []
-        
-        for req in received_requests:
-            requester = User.query.get(req.requester_id)
-            received_list.append({
-                'id': req.id,
-                'requester_email': requester.email if requester else 'Unknown',
-                'requester_id': req.requester_id,
-                'status': req.status,
-                'created_at': req.created_at.isoformat(),
-                'type': 'received'
-            })
-        
-        current_app.logger.info(f"Request list retrieved for user {current_user_id}: {len(sent_list)} sent, {len(received_list)} received")
-        
-        return {
-            'sent_requests': sent_list,
-            'received_requests': received_list
-        }
-        
-    except Exception as e:
-        current_app.logger.error(f"Failed to list requests for user {current_user_id}: {str(e)}")
-        return {'error': 'Failed to retrieve requests. Please try again.'}, 500
-
-@verification_bp.route('/verifications', methods=['POST'])
-@token_required
-def create_verification(current_user_id):
-    """Submit a verification response (photo + location) - JWT protected"""
-    try:
-        # Validate request has JSON data
-        if not request.is_json:
-            current_app.logger.warning(f"Verification creation attempt without JSON data by user {current_user_id}")
-            return {'error': 'Request must be JSON'}, 400
-        
-        data = request.get_json()
-        
-        # Validate required fields
-        if not data:
-            return {'error': 'No data provided'}, 400
-        
-        required_fields = ['request_id', 'photo_url', 'latitude', 'longitude']
-        missing_fields = [field for field in required_fields if not data.get(field)]
-        
-        if missing_fields:
-            current_app.logger.warning(f"Verification creation with missing fields: {missing_fields} by user {current_user_id}")
-            return {'error': f'Missing required fields: {", ".join(missing_fields)}'}, 400
-        
-        request_id = data.get('request_id')
-        photo_url = data.get('photo_url').strip()
-        latitude = data.get('latitude')
-        longitude = data.get('longitude')
-        
-        # Validate coordinates
-        if not validate_coordinates(latitude, longitude):
-            current_app.logger.warning(f"Verification creation with invalid coordinates: lat={latitude}, lng={longitude} by user {current_user_id}")
-            return {'error': 'Invalid latitude or longitude values'}, 400
-        
-        # Validate photo URL (basic check)
-        if len(photo_url) < 10:  # Very basic validation
-            current_app.logger.warning(f"Verification creation with invalid photo URL: {photo_url} by user {current_user_id}")
-            return {'error': 'Invalid photo URL'}, 400
-        
-        # Check if request exists and is still pending
         verification_request = Request.query.get(request_id)
         if not verification_request:
-            current_app.logger.warning(f"Verification creation for non-existent request: {request_id} by user {current_user_id}")
-            return {'error': 'Verification request not found'}, 404
-        
-        # Check if this user is the target of the request
-        current_user = User.query.get(current_user_id)
-        if not current_user or current_user.email != verification_request.target_email:
-            current_app.logger.warning(f"User {current_user_id} tried to respond to request {request_id} not meant for them")
-            return {'error': 'You can only respond to requests sent to your email'}, 403
-        
-        if verification_request.status != 'pending':
-            current_app.logger.warning(f"Verification creation for non-pending request {request_id}: status={verification_request.status} by user {current_user_id}")
-            return {'error': f'Request has already been {verification_request.status}'}, 400
-        
-        # Check if verification already exists for this request
-        existing_verification = Verification.query.filter_by(request_id=request_id).first()
-        if existing_verification:
-            current_app.logger.warning(f"Duplicate verification attempted for request {request_id} by user {current_user_id}")
-            return {'error': 'Verification already exists for this request'}, 409
-        
-        # Create verification
-        new_verification = Verification(
-            request_id=request_id,
-            photo_url=photo_url,
-            latitude=float(latitude),
-            longitude=float(longitude)
-        )
-        db.session.add(new_verification)
-        
-        # Update request status
-        verification_request.status = 'completed'
-        
-        db.session.commit()
-        
-        current_app.logger.info(f"✅ Verification created: ID {new_verification.id} for request {request_id} by user {current_user_id}")
-        
-        return {
-            'message': 'Verification submitted successfully',
-            'verification': {
-                'id': new_verification.id,
-                'request_id': new_verification.request_id,
-                'photo_url': new_verification.photo_url,
-                'latitude': float(new_verification.latitude),
-                'longitude': float(new_verification.longitude),
-                'created_at': new_verification.created_at.isoformat()
-            }
-        }, 201
-        
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"Verification creation failed for user {current_user_id}: {str(e)}")
-        return {'error': 'Failed to submit verification. Please try again.'}, 500
-
-@verification_bp.route('/verifications/<int:request_id>', methods=['GET'])
-@token_required
-def get_verification(current_user_id, request_id):
-    """Get verification details for a specific request (JWT protected)"""
-    try:
-        # Get the verification for this request
-        verification = Verification.query.filter_by(request_id=request_id).first()
-        if not verification:
-            current_app.logger.warning(f"Verification lookup for non-existent verification: request_id={request_id} by user {current_user_id}")
-            return {'error': 'Verification not found'}, 404
-        
-        # Get the original request details
-        original_request = Request.query.get(request_id)
-        if not original_request:
-            current_app.logger.error(f"Verification exists but request doesn't: request_id={request_id}")
             return {'error': 'Request not found'}, 404
         
-        # Check if current user has permission to view this verification
         current_user = User.query.get(current_user_id)
         if not current_user:
             return {'error': 'User not found'}, 404
         
-        # User can view if they are either:
-        # 1. The requester (who asked for verification)
-        # 2. The target (who provided verification)
-        can_view = (
-            original_request.requester_id == current_user_id or  # User requested this
-            original_request.target_email == current_user.email   # User was asked to verify
-        )
+        is_requester = verification_request.requester_id == current_user_id
+        is_target = current_user.email == verification_request.target_email
         
-        if not can_view:
-            current_app.logger.warning(f"User {current_user_id} tried to view verification {request_id} without permission")
-            return {'error': 'You do not have permission to view this verification'}, 403
+        if not (is_requester or is_target):
+            return {'error': 'You can only delete your own requests or requests sent to you'}, 403
         
-        # Get requester details
-        requester = User.query.get(original_request.requester_id)
+        if is_requester:
+            if verification_request.status == 'completed':
+                existing_key = ShareableKey.query.filter_by(
+                    creator_id=verification_request.target_user_id,
+                    recipient_user_id=verification_request.requester_id,
+                    notes=db.func.concat('Verification response for request: ', verification_request.label)
+                ).first()
+                
+                if existing_key:
+                    return {'error': 'This completed request has been turned into a key. Check your received keys.'}, 400
+            
+            if verification_request.status not in ['pending', 'denied', 'cancelled', 'completed']:
+                return {'error': f'Cannot delete a {verification_request.status} request'}, 400
         
-        current_app.logger.info(f"Verification details retrieved: verification_id={verification.id}, request_id={request_id} by user {current_user_id}")
+        db.session.delete(verification_request)
+        db.session.commit()
+        
+        current_app.logger.info(f"✅ Request deleted: ID {request_id} by user {current_user_id}")
         
         return {
-            'verification': {
-                'id': verification.id,
-                'photo_url': verification.photo_url,
-                'latitude': float(verification.latitude),
-                'longitude': float(verification.longitude),
-                'created_at': verification.created_at.isoformat()
-            },
-            'request': {
-                'id': original_request.id,
-                'requester_email': requester.email if requester else 'Unknown',
-                'target_email': original_request.target_email,
-                'status': original_request.status,
-                'created_at': original_request.created_at.isoformat()
-            }
-        }
+            'message': 'Request deleted successfully'
+        }, 200
         
     except Exception as e:
-        current_app.logger.error(f"Failed to retrieve verification for request {request_id} by user {current_user_id}: {str(e)}")
-        return {'error': 'Failed to retrieve verification. Please try again.'}, 500
+        db.session.rollback()
+        current_app.logger.error(f"Failed to delete request {request_id}: {str(e)}")
+        return {'error': 'Failed to delete request'}, 500
+
+@verification_bp.route('/requests/<int:request_id>/deny', methods=['POST'])
+@token_required
+def deny_request(current_user_id, request_id):
+    try:
+        verification_request = Request.query.get(request_id)
+        if not verification_request:
+            return {'error': 'Request not found'}, 404
+        
+        current_user = User.query.get(current_user_id)
+        if not current_user or current_user.email != verification_request.target_email:
+            return {'error': 'You can only deny requests sent to you'}, 403
+        
+        if verification_request.status != 'pending':
+            return {'error': f'Cannot deny a {verification_request.status} request'}, 400
+        
+        verification_request.status = 'denied'
+        verification_request.response_at = datetime.utcnow()
+        
+        db.session.commit()
+        
+        current_app.logger.info(f"✅ Request denied: ID {request_id} by user {current_user_id}")
+        
+        return {
+            'message': 'Request denied successfully'
+        }, 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to deny request {request_id} for user {current_user_id}: {str(e)}")
+        return {'error': 'Failed to deny request'}, 500
+
+@verification_bp.route('/requests/<int:request_id>', methods=['PUT'])
+@token_required
+def update_request(current_user_id, request_id):
+    try:
+        data = request.get_json()
+        
+        verification_request = Request.query.get(request_id)
+        if not verification_request:
+            return {'error': 'Request not found'}, 404
+        
+        if verification_request.requester_id != current_user_id:
+            return {'error': 'You can only update your own requests'}, 403
+        
+        if verification_request.status != 'pending':
+            return {'error': f'Cannot update a {verification_request.status} request'}, 400
+        
+        if 'label' in data:
+            is_valid, error_message = validate_title(data.get('label', ''))
+            if not is_valid:
+                return {'error': error_message}, 400
+            verification_request.label = data['label'].strip()
+        
+        if 'notes' in data:
+            verification_request.notes = data['notes']
+        if 'information_types' in data:
+            if isinstance(data['information_types'], list):
+                verification_request.set_information_types(data['information_types'])
+            else:
+                return {'error': 'Information types must be a list'}, 400
+        
+        db.session.commit()
+        
+        current_app.logger.info(f"✅ Request updated: ID {request_id} by user {current_user_id}")
+        
+        return {
+            'message': 'Request updated successfully'
+        }, 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to update request {request_id} for user {current_user_id}: {str(e)}")
+        return {'error': 'Failed to update request'}, 500
+
+@verification_bp.route('/verifications', methods=['POST'])
+@token_required
+def submit_verification(current_user_id):
+    try:
+        data = request.get_json()
+        current_app.logger.info(f"🚀 Submitting verification response: {data}")
+        
+        if not data.get('request_id'):
+            return {'error': 'Request ID is required'}, 400
+        
+        request_id = data['request_id']
+        
+        verification_request = Request.query.get(request_id)
+        if not verification_request:
+            return {'error': 'Request not found'}, 404
+        
+        current_user = User.query.get(current_user_id)
+        if not current_user or current_user.email != verification_request.target_email:
+            return {'error': 'You can only respond to requests sent to you'}, 403
+        
+        if verification_request.status != 'pending':
+            return {'error': f'Cannot respond to a {verification_request.status} request'}, 400
+        
+        new_key = ShareableKey(
+            key_uuid=str(uuid.uuid4()),
+            creator_id=current_user_id,
+            recipient_email=verification_request.requester.email,
+            recipient_user_id=verification_request.requester_id,
+            label=f"Response to: {verification_request.label}",
+            views_allowed=2,
+            is_shareable_link=False,
+            notes=f"Verification response for request: {verification_request.label}",
+            status='active'
+        )
+        
+        new_key.set_information_types(verification_request.get_information_types())
+        
+        user_data = {}
+        information_types = verification_request.get_information_types()
+        
+        for info_type in information_types:
+            if info_type == 'fullname':
+                if current_user.first_name and current_user.last_name:
+                    user_data['fullname'] = f"{current_user.first_name} {current_user.last_name}"
+                else:
+                    user_data['fullname'] = "Name not available"
+            
+            elif info_type == 'firstname':
+                user_data['firstname'] = current_user.first_name or "First name not available"
+            
+            elif info_type == 'age':
+                user_data['age'] = str(current_user.age) if current_user.age else "Age not provided"
+            
+            elif info_type == 'location':
+                if 'latitude' in data and 'longitude' in data:
+                    user_data['location'] = {
+                        'latitude': data['latitude'],
+                        'longitude': data['longitude'],
+                        'cityDisplay': 'Location captured'
+                    }
+                else:
+                    user_data['location'] = {
+                        'cityDisplay': 'Location not captured',
+                        'latitude': None,
+                        'longitude': None
+                    }
+            
+            elif info_type in ['selfie', 'photo']:
+                if 'photo_base64' in data:
+                    user_data[info_type] = {
+                        'status': 'captured',
+                        'image_data': data['photo_base64'],
+                        'captured_at': datetime.utcnow().isoformat()
+                    }
+                else:
+                    user_data[info_type] = {
+                        'status': 'not_captured',
+                        'image_data': None,
+                        'captured_at': None
+                    }
+        
+        new_key.set_user_data(user_data)
+        
+        db.session.add(new_key)
+        verification_request.status = 'completed'
+        verification_request.response_at = datetime.utcnow()
+        db.session.commit()
+        
+        current_app.logger.info(f"✅ Verification response submitted: Request {request_id} by user {current_user_id}")
+        current_app.logger.info(f"📊 Response contains data: {list(user_data.keys())}")
+        
+        return {
+            'message': 'Verification response submitted successfully',
+            'key_id': new_key.id,
+            'key_uuid': new_key.key_uuid
+        }, 201
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"❌ Failed to submit verification response: {str(e)}")
+        return {'error': 'Failed to submit verification response'}, 500
