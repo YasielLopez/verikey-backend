@@ -12,6 +12,16 @@ profile_bp = Blueprint('profile', __name__)
 @profile_bp.route('/profile', methods=['GET'])
 @token_required
 def get_profile(current_user_id):
+    """Get user profile - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("60 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '60 requests per minute allowed'}, 429
+    
     try:
         user = User.query.get(current_user_id)
         if not user:
@@ -20,6 +30,7 @@ def get_profile(current_user_id):
         return {
             'profile': user.to_dict()
         }, 200
+        
     except Exception as e:
         current_app.logger.error(f"Get profile failed for user {current_user_id}: {str(e)}")
         return {'error': 'Failed to get profile'}, 500
@@ -27,6 +38,16 @@ def get_profile(current_user_id):
 @profile_bp.route('/profile', methods=['POST'])
 @token_required
 def update_profile(current_user_id):
+    """Update user profile - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("10 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '10 profile updates per hour allowed'}, 429
+    
     try:
         user = User.query.get(current_user_id)
         if not user:
@@ -36,7 +57,6 @@ def update_profile(current_user_id):
         
         immutable_fields = ['first_name', 'last_name', 'date_of_birth', 'age']
         attempted_changes = []
-        
         for field in immutable_fields:
             if field in data:
                 attempted_changes.append(field)
@@ -104,6 +124,7 @@ def update_profile(current_user_id):
             user.bio = data['bio'].strip() if data['bio'] else None
         
         db.session.commit()
+        
         current_app.logger.info(f"✅ Profile updated for user {current_user_id}")
         
         return {
@@ -119,6 +140,16 @@ def update_profile(current_user_id):
 @profile_bp.route('/profile/photo', methods=['POST'])
 @token_required
 def update_profile_photo(current_user_id):
+    """Update profile photo - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("20 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '20 photo updates per hour allowed'}, 429
+    
     try:
         user = User.query.get(current_user_id)
         if not user:
@@ -132,12 +163,12 @@ def update_profile_photo(current_user_id):
             if photo_data and photo_data.startswith('data:image'):
                 if len(photo_data) > 100000:
                     return {'error': 'Photo too large. Please use a smaller image.'}, 400
-                
                 user.profile_image_url = photo_data
             else:
                 user.profile_image_url = photo_data
             
             db.session.commit()
+            
             current_app.logger.info(f"✅ Profile photo updated for user {current_user_id}")
             
             return {
@@ -155,6 +186,16 @@ def update_profile_photo(current_user_id):
 @profile_bp.route('/profile/check-screen-name', methods=['POST'])
 @token_required
 def check_screen_name(current_user_id):
+    """Check screen name availability - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 checks per minute allowed'}, 429
+    
     try:
         data = request.get_json()
         screen_name = data.get('screen_name', '').strip().lstrip('@').lower()
@@ -184,6 +225,16 @@ def check_screen_name(current_user_id):
 @profile_bp.route('/users/search', methods=['GET'])
 @token_required
 def search_users(current_user_id):
+    """Search users - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 searches per minute allowed'}, 429
+    
     try:
         query = request.args.get('q', '').strip()
         
@@ -223,6 +274,16 @@ def search_users(current_user_id):
 @profile_bp.route('/users/lookup', methods=['POST'])
 @token_required
 def lookup_user(current_user_id):
+    """Lookup user - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 lookups per minute allowed'}, 429
+    
     try:
         data = request.get_json()
         identifier = data.get('identifier', '').strip()
@@ -233,7 +294,6 @@ def lookup_user(current_user_id):
         current_app.logger.info(f"🔍 User lookup for '{identifier}' by user {current_user_id}")
         
         user = None
-        
         if identifier.startswith('@'):
             clean_identifier = identifier[1:].lower()
             user = User.query.filter(
@@ -279,10 +339,20 @@ def lookup_user(current_user_id):
 @profile_bp.route('/profile/delete', methods=['POST'])
 @token_required
 def delete_account(current_user_id):
+    """Delete account - Very strict rate limiting"""
+    # Apply very strict rate limiting for account deletion
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("2 per day")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': 'Account deletion limited to 2 attempts per day'}, 429
+    
     try:
         data = request.get_json()
-        
         password = data.get('password')
+        
         if not password:
             return {'error': 'Password is required to delete account'}, 400
         
@@ -339,7 +409,6 @@ def delete_account(current_user_id):
                 'message': 'Account has been deleted successfully',
                 'deleted_at': user.deleted_at.isoformat()
             }, 200
-            
         else:
             KYCVerification.query.filter_by(user_id=current_user_id).delete()
             

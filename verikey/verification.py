@@ -3,7 +3,7 @@ from werkzeug.exceptions import BadRequest
 import re
 import uuid
 from verikey.models import db
-from verikey.models import User, Request, ShareableKey 
+from verikey.models import User, Request, ShareableKey
 from verikey.decorators import token_required
 from datetime import datetime
 import json
@@ -42,6 +42,16 @@ def validate_title(title: str) -> tuple[bool, str]:
 @verification_bp.route('/requests', methods=['GET'])
 @token_required
 def get_requests(current_user_id):
+    """Get all requests - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("60 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '60 requests per minute allowed'}, 429
+    
     try:
         current_user = User.query.get(current_user_id)
         if not current_user:
@@ -59,7 +69,7 @@ def get_requests(current_user_id):
         for req in sent_requests:
             if req.status == 'completed':
                 continue
-                
+            
             target_user = User.query.get(req.target_user_id) if req.target_user_id else None
             
             if target_user and target_user.screen_name:
@@ -88,7 +98,7 @@ def get_requests(current_user_id):
         for req in received_requests:
             if req.status == 'completed':
                 continue
-                
+            
             requester = User.query.get(req.requester_id)
             
             if requester and requester.screen_name:
@@ -127,6 +137,16 @@ def get_requests(current_user_id):
 @verification_bp.route('/requests', methods=['POST'])
 @token_required
 def create_request(current_user_id):
+    """Create request - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 requests per hour allowed'}, 429
+    
     try:
         data = request.get_json()
         current_app.logger.info(f"🚀 Creating request with data: {data}")
@@ -142,6 +162,7 @@ def create_request(current_user_id):
         
         if not data.get('target_email'):
             return {'error': 'Target email is required'}, 400
+        
         if not data.get('information_types'):
             return {'error': 'Information types are required'}, 400
         
@@ -149,7 +170,6 @@ def create_request(current_user_id):
         target_identifier = data['target_email'].strip()
         
         target_user = User.query.filter_by(email=target_identifier).first()
-        
         if not target_user:
             clean_identifier = target_identifier.lstrip('@').lower()
             target_user = User.query.filter_by(screen_name=clean_identifier).first()
@@ -195,8 +215,19 @@ def create_request(current_user_id):
 @verification_bp.route('/requests/<int:request_id>', methods=['DELETE'])
 @token_required
 def delete_request(current_user_id, request_id):
+    """Delete request - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 operations per hour allowed'}, 429
+    
     try:
         verification_request = Request.query.get(request_id)
+        
         if not verification_request:
             return {'error': 'Request not found'}, 404
         
@@ -241,8 +272,19 @@ def delete_request(current_user_id, request_id):
 @verification_bp.route('/requests/<int:request_id>/deny', methods=['POST'])
 @token_required
 def deny_request(current_user_id, request_id):
+    """Deny request - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 operations per hour allowed'}, 429
+    
     try:
         verification_request = Request.query.get(request_id)
+        
         if not verification_request:
             return {'error': 'Request not found'}, 404
         
@@ -272,10 +314,20 @@ def deny_request(current_user_id, request_id):
 @verification_bp.route('/requests/<int:request_id>', methods=['PUT'])
 @token_required
 def update_request(current_user_id, request_id):
+    """Update request - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 operations per hour allowed'}, 429
+    
     try:
         data = request.get_json()
-        
         verification_request = Request.query.get(request_id)
+        
         if not verification_request:
             return {'error': 'Request not found'}, 404
         
@@ -293,6 +345,7 @@ def update_request(current_user_id, request_id):
         
         if 'notes' in data:
             verification_request.notes = data['notes']
+        
         if 'information_types' in data:
             if isinstance(data['information_types'], list):
                 verification_request.set_information_types(data['information_types'])
@@ -315,6 +368,16 @@ def update_request(current_user_id, request_id):
 @verification_bp.route('/verifications', methods=['POST'])
 @token_required
 def submit_verification(current_user_id):
+    """Submit verification - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 verifications per hour allowed'}, 429
+    
     try:
         data = request.get_json()
         current_app.logger.info(f"🚀 Submitting verification response: {data}")
@@ -323,8 +386,8 @@ def submit_verification(current_user_id):
             return {'error': 'Request ID is required'}, 400
         
         request_id = data['request_id']
-        
         verification_request = Request.query.get(request_id)
+        
         if not verification_request:
             return {'error': 'Request not found'}, 404
         
@@ -335,13 +398,18 @@ def submit_verification(current_user_id):
         if verification_request.status != 'pending':
             return {'error': f'Cannot respond to a {verification_request.status} request'}, 400
         
+        # Handle views_allowed from the request
+        views_allowed = data.get('views_allowed', 2)
+        if views_allowed <= 0:
+            views_allowed = 2
+        
         new_key = ShareableKey(
             key_uuid=str(uuid.uuid4()),
             creator_id=current_user_id,
             recipient_email=verification_request.requester.email,
             recipient_user_id=verification_request.requester_id,
             label=f"Response to: {verification_request.label}",
-            views_allowed=2,
+            views_allowed=views_allowed,  # Use the value from the request
             is_shareable_link=False,
             notes=f"Verification response for request: {verification_request.label}",
             status='active'
@@ -352,26 +420,47 @@ def submit_verification(current_user_id):
         user_data = {}
         information_types = verification_request.get_information_types()
         
+        # Parse additional_data if it exists
+        additional_data = {}
+        if 'additional_data' in data and data['additional_data']:
+            try:
+                additional_data = json.loads(data['additional_data'])
+            except json.JSONDecodeError:
+                current_app.logger.warning(f"Failed to parse additional_data: {data['additional_data']}")
+        
         for info_type in information_types:
             if info_type == 'fullname':
-                if current_user.first_name and current_user.last_name:
+                # Check additional_data first, then fall back to user profile
+                if 'fullname' in additional_data:
+                    user_data['fullname'] = additional_data['fullname']
+                elif current_user.first_name and current_user.last_name:
                     user_data['fullname'] = f"{current_user.first_name} {current_user.last_name}"
                 else:
                     user_data['fullname'] = "Name not available"
             
             elif info_type == 'firstname':
-                user_data['firstname'] = current_user.first_name or "First name not available"
+                # Check additional_data first, then fall back to user profile
+                if 'firstname' in additional_data:
+                    user_data['firstname'] = additional_data['firstname']
+                else:
+                    user_data['firstname'] = current_user.first_name or "First name not available"
             
             elif info_type == 'age':
-                user_data['age'] = str(current_user.age) if current_user.age else "Age not provided"
+                # Check additional_data first, then fall back to user profile
+                if 'age' in additional_data:
+                    user_data['age'] = str(additional_data['age'])
+                else:
+                    user_data['age'] = str(current_user.age) if current_user.age else "Age not provided"
             
             elif info_type == 'location':
                 if 'latitude' in data and 'longitude' in data:
                     user_data['location'] = {
                         'latitude': data['latitude'],
                         'longitude': data['longitude'],
-                        'cityDisplay': 'Location captured'
+                        'cityDisplay': data.get('location_city_display', 'Location captured')
                     }
+                elif 'location_data' in data:
+                    user_data['location'] = data['location_data']
                 else:
                     user_data['location'] = {
                         'cityDisplay': 'Location not captured',
@@ -379,15 +468,30 @@ def submit_verification(current_user_id):
                         'longitude': None
                     }
             
-            elif info_type in ['selfie', 'photo']:
+            # FIXED: Handle selfie and photo separately
+            elif info_type == 'selfie':
+                if 'selfie_base64' in data:
+                    user_data['selfie'] = {
+                        'status': 'captured',
+                        'image_data': data['selfie_base64'],
+                        'captured_at': datetime.utcnow().isoformat()
+                    }
+                else:
+                    user_data['selfie'] = {
+                        'status': 'not_captured',
+                        'image_data': None,
+                        'captured_at': None
+                    }
+            
+            elif info_type == 'photo':
                 if 'photo_base64' in data:
-                    user_data[info_type] = {
+                    user_data['photo'] = {
                         'status': 'captured',
                         'image_data': data['photo_base64'],
                         'captured_at': datetime.utcnow().isoformat()
                     }
                 else:
-                    user_data[info_type] = {
+                    user_data['photo'] = {
                         'status': 'not_captured',
                         'image_data': None,
                         'captured_at': None
@@ -396,8 +500,10 @@ def submit_verification(current_user_id):
         new_key.set_user_data(user_data)
         
         db.session.add(new_key)
+        
         verification_request.status = 'completed'
         verification_request.response_at = datetime.utcnow()
+        
         db.session.commit()
         
         current_app.logger.info(f"✅ Verification response submitted: Request {request_id} by user {current_user_id}")

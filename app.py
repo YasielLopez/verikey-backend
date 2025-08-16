@@ -1,28 +1,69 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_wtf.csrf import CSRFProtect, generate_csrf
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 import os
 import logging
 from datetime import datetime, timezone
 import traceback
+import redis
 
 load_dotenv()
 
 # Create Flask app
 app = Flask(__name__)
 
+# CORS configuration with CSRF support
 CORS(app, origins=[
     "http://localhost:3000",
-    "http://localhost:19000",
+    "http://localhost:19000", 
     "http://10.0.0.176:19000",
     "exp://10.0.0.176:19000",
-], supports_credentials=True)
+], supports_credentials=True, expose_headers=['X-CSRF-Token'])
 
 # Configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
-app.config['JWT_EXPIRATION_HOURS'] = 24
+app.config['REFRESH_SECRET_KEY'] = os.getenv('REFRESH_SECRET_KEY', os.getenv('SECRET_KEY') + '_refresh')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 3600))
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = int(os.getenv('JWT_REFRESH_TOKEN_EXPIRES', 604800))
+
+# CSRF Protection Configuration
+app.config['WTF_CSRF_ENABLED'] = os.getenv('WTF_CSRF_ENABLED', 'True').lower() == 'true'
+app.config['WTF_CSRF_TIME_LIMIT'] = None  # No time limit for CSRF tokens
+app.config['WTF_CSRF_CHECK_DEFAULT'] = False  # We'll manually check where needed
+
+csrf = CSRFProtect(app)
+
+# Rate limiting configuration
+def get_limiter_storage_uri():
+    """Get Redis URL for rate limiting, fall back to memory if not available"""
+    redis_url = os.getenv('REDIS_URL')
+    if redis_url:
+        try:
+            # Test Redis connection
+            r = redis.from_url(redis_url)
+            r.ping()
+            print("✅ Redis connected for rate limiting")
+            return redis_url
+        except:
+            print("⚠️ Redis not available, using memory for rate limiting")
+    return "memory://"
+
+# Initialize limiter globally
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri=get_limiter_storage_uri(),
+    swallow_errors=False  # Show errors for debugging
+)
+
+# Make limiter available globally for blueprints
+app.limiter = limiter
 
 # Initialize database
 from verikey.models import db
@@ -32,6 +73,7 @@ db.init_app(app)
 with app.app_context():
     try:
         from verikey.models import User, Request, ShareableKey, KYCVerification
+        from verikey.models_auth import RefreshToken
         db.create_all()
         print("✅ Database tables created")
     except Exception as e:
@@ -57,13 +99,29 @@ except Exception as e:
     print(f"❌ Blueprint error: {e}")
     traceback.print_exc()
 
+# Exempt auth endpoints from CSRF (they use different protection)
+csrf.exempt(auth_bp)
+
+@app.route('/csrf-token', methods=['GET'])
+def get_csrf_token():
+    """Endpoint to get CSRF token for the frontend"""
+    token = generate_csrf()
+    response = jsonify({'csrf_token': token})
+    response.headers['X-CSRF-Token'] = token
+    return response
+
 @app.route('/users/lookup', methods=['POST'])
+@limiter.limit("30 per minute")
 def lookup_user():
     """Look up a user by email or username"""
     from flask import request, jsonify
     from verikey.models import User, db
     from verikey.decorators import token_required
     import jwt
+    
+    # CSRF protection for state-changing operations
+    if app.config['WTF_CSRF_ENABLED']:
+        csrf.protect()
     
     token = None
     if 'Authorization' in request.headers:
@@ -139,6 +197,25 @@ def home():
 @app.route('/health')
 def health():
     return jsonify({'status': 'healthy'})
+
+@app.route('/debug/limiter', methods=['GET'])
+def debug_limiter():
+    """Debug endpoint to check limiter status"""
+    limiter_info = {
+        'limiter_exists': limiter is not None,
+        'storage_backend': str(limiter._storage_uri) if limiter else 'none',
+        'redis_url': os.getenv('REDIS_URL', 'not set'),
+        'enabled': True
+    }
+    return jsonify(limiter_info)
+
+# Error handler for rate limit exceeded
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        'error': 'Rate limit exceeded',
+        'message': str(e.description)
+    }), 429
 
 if __name__ == '__main__':
     print("🚀 Starting Verikey API...")

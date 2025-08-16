@@ -40,9 +40,18 @@ def validate_title(title: str) -> tuple[bool, str]:
 @keys_bp.route('/keys', methods=['GET'])
 @token_required
 def get_all_keys(current_user_id):
+    """Get all keys for the current user"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("60 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '60 requests per minute allowed'}, 429
+    
     try:
         sent_keys = ShareableKey.query.filter_by(creator_id=current_user_id).order_by(ShareableKey.created_at.desc()).all()
-        
         received_keys = ShareableKey.query.filter_by(recipient_user_id=current_user_id).order_by(ShareableKey.created_at.desc()).all()
         
         keys_to_update = []
@@ -89,7 +98,7 @@ def get_all_keys(current_user_id):
                 'views': f"{key.views_used}/{key.views_allowed}" if key.views_allowed != 999 else "Unlimited",
                 'views_used': key.views_used,
                 'views_allowed': key.views_allowed,
-                'viewsRemaining': max(0, key.views_allowed - key.views_used),
+                'viewsRemaining': max(0, key.views_allowed - key.views_used) if key.views_allowed != 999 else 999,
                 'sentOn': sent_date,
                 'created_at': key.created_at.isoformat() if key.created_at else None,
                 'lastViewed': key.last_viewed_at.strftime('%m/%d/%Y at %I:%M %p') if key.last_viewed_at else 'Not Viewed',
@@ -144,7 +153,7 @@ def get_all_keys(current_user_id):
                 'views': f"{key.views_used}/{key.views_allowed}" if key.views_allowed != 999 else "Unlimited",
                 'views_used': key.views_used,
                 'views_allowed': key.views_allowed,
-                'viewsRemaining': max(0, key.views_allowed - key.views_used),
+                'viewsRemaining': max(0, key.views_allowed - key.views_used) if key.views_allowed != 999 else 999,
                 'receivedOn': received_date,
                 'created_at': key.created_at.isoformat() if key.created_at else None,
                 'informationTypes': key.get_information_types(),
@@ -176,6 +185,16 @@ def get_all_keys(current_user_id):
 @keys_bp.route('/keys', methods=['POST'])
 @token_required
 def create_shareable_key(current_user_id):
+    """Create a new shareable key - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("20 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '20 keys per hour allowed'}, 429
+    
     try:
         data = request.get_json()
         current_app.logger.info(f"🚀 Creating key with data: {data}")
@@ -232,36 +251,50 @@ def create_shareable_key(current_user_id):
             if info_type == 'fullname':
                 user_data['fullname'] = current_user.display_full_name
                 user_data['is_verified'] = current_user.is_verified
-                
             elif info_type == 'firstname':
                 user_data['firstname'] = current_user.display_first_name
                 user_data['is_verified'] = current_user.is_verified
-                
             elif info_type == 'age':
                 user_data['age'] = str(current_user.age) if current_user.age else "Age not available"
                 user_data['is_verified'] = current_user.is_verified
-                
             elif info_type == 'location':
-                if 'location_data' in data:
+                # Check for location_data first (complete object)
+                if 'location_data' in data and isinstance(data['location_data'], dict):
                     location_data = data['location_data']
                     user_data['location'] = {
                         'cityDisplay': location_data.get('cityDisplay', 'Location captured'),
+                        'latitude': location_data.get('latitude'),
+                        'longitude': location_data.get('longitude')
+                    }
+                # Then check for individual latitude/longitude fields
+                elif 'latitude' in data and 'longitude' in data:
+                    user_data['location'] = {
+                        'cityDisplay': data.get('location_city_display', 'Location captured'),
+                        'latitude': data.get('latitude'),
+                        'longitude': data.get('longitude')
                     }
                 elif 'user_data' in data and 'location' in data['user_data']:
                     location_data = data['user_data']['location']
                     user_data['location'] = {
                         'cityDisplay': location_data.get('cityDisplay', 'Location captured'),
+                        'latitude': location_data.get('latitude'),
+                        'longitude': location_data.get('longitude')
                     }
                 else:
                     user_data['location'] = {
                         'cityDisplay': 'Location not captured'
                     }
-                    
             elif info_type == 'selfie':
                 if 'selfie_data' in data:
                     user_data['selfie'] = {
                         'status': 'captured',
                         'image_data': data['selfie_data'],
+                        'captured_at': datetime.utcnow().isoformat()
+                    }
+                elif 'selfie_base64' in data:
+                    user_data['selfie'] = {
+                        'status': 'captured',
+                        'image_data': data['selfie_base64'],
                         'captured_at': datetime.utcnow().isoformat()
                     }
                 elif 'user_data' in data and 'selfie' in data['user_data']:
@@ -271,12 +304,17 @@ def create_shareable_key(current_user_id):
                         'status': 'not_captured',
                         'image_data': None
                     }
-                    
             elif info_type == 'photo':
                 if 'photo_data' in data:
                     user_data['photo'] = {
                         'status': 'captured',
                         'image_data': data['photo_data'],
+                        'captured_at': datetime.utcnow().isoformat()
+                    }
+                elif 'photo_base64' in data:
+                    user_data['photo'] = {
+                        'status': 'captured',
+                        'image_data': data['photo_base64'],
                         'captured_at': datetime.utcnow().isoformat()
                     }
                 elif 'user_data' in data and 'photo' in data['user_data']:
@@ -302,6 +340,7 @@ def create_shareable_key(current_user_id):
         
         current_app.logger.info(f"✅ Created shareable key: {new_key.key_uuid} (ID: {new_key.id})")
         current_app.logger.info(f"📊 Key includes: {', '.join(information_types)}")
+        current_app.logger.info(f"👁 Views allowed: {views_allowed}")
         
         return {
             'message': 'Shareable key created successfully',
@@ -316,8 +355,18 @@ def create_shareable_key(current_user_id):
         return {'error': 'Failed to create key'}, 500
 
 @keys_bp.route('/verifications', methods=['POST'])
-@token_required  
+@token_required
 def submit_verification_response(current_user_id):
+    """Submit verification response - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 verifications per hour allowed'}, 429
+    
     try:
         data = request.get_json()
         request_id = data.get('request_id')
@@ -338,13 +387,18 @@ def submit_verification_response(current_user_id):
         if current_user.email != verification_request.target_email:
             return {'error': 'You can only respond to requests sent to you'}, 403
         
+        # Get views_allowed from request data, default to 2
+        views_allowed = data.get('views_allowed', 2)
+        if views_allowed <= 0:
+            views_allowed = 2
+        
         new_key = ShareableKey(
             key_uuid=str(uuid.uuid4()),
             creator_id=current_user_id,
             recipient_email=verification_request.requester.email,
             recipient_user_id=verification_request.requester_id,
             label=f"Response to: {verification_request.label}",
-            views_allowed=2,
+            views_allowed=views_allowed,
             is_shareable_link=False,
             notes=f"Verification response for request: {verification_request.label}",
             status='active'
@@ -355,38 +409,80 @@ def submit_verification_response(current_user_id):
         user_data = {}
         information_types = verification_request.get_information_types()
         
+        # Parse additional_data if it exists
+        additional_data = {}
+        if 'additional_data' in data and data['additional_data']:
+            try:
+                additional_data = json.loads(data['additional_data'])
+            except json.JSONDecodeError:
+                current_app.logger.warning(f"Failed to parse additional_data")
+        
         for info_type in information_types:
             if info_type == 'fullname':
-                user_data['fullname'] = current_user.display_full_name
+                if 'fullname' in additional_data:
+                    user_data['fullname'] = additional_data['fullname']
+                else:
+                    user_data['fullname'] = current_user.display_full_name
                 user_data['is_verified'] = current_user.is_verified
-                
             elif info_type == 'firstname':
-                user_data['firstname'] = current_user.display_first_name
+                if 'firstname' in additional_data:
+                    user_data['firstname'] = additional_data['firstname']
+                else:
+                    user_data['firstname'] = current_user.display_first_name
                 user_data['is_verified'] = current_user.is_verified
-                
             elif info_type == 'age':
-                user_data['age'] = str(current_user.age) if current_user.age else "Age not provided"
+                if 'age' in additional_data:
+                    user_data['age'] = str(additional_data['age'])
+                else:
+                    user_data['age'] = str(current_user.age) if current_user.age else "Age not provided"
                 user_data['is_verified'] = current_user.is_verified
-                
             elif info_type == 'location':
-                if 'latitude' in data and 'longitude' in data:
+                # Handle location data properly
+                if 'location_data' in data and isinstance(data['location_data'], dict):
+                    location_data = data['location_data']
                     user_data['location'] = {
-                        'cityDisplay': data.get('cityDisplay', 'Location captured')
+                        'cityDisplay': location_data.get('cityDisplay', 'Location captured'),
+                        'latitude': location_data.get('latitude'),
+                        'longitude': location_data.get('longitude')
+                    }
+                elif 'latitude' in data and 'longitude' in data:
+                    user_data['location'] = {
+                        'cityDisplay': data.get('location_city_display', 'Location captured'),
+                        'latitude': data.get('latitude'),
+                        'longitude': data.get('longitude')
                     }
                 else:
                     user_data['location'] = {
                         'cityDisplay': 'Location not captured'
                     }
-                    
-            elif info_type in ['selfie', 'photo']:
-                if 'photo_base64' in data:
-                    user_data[info_type] = {
+            elif info_type == 'selfie':
+                if 'selfie_base64' in data:
+                    user_data['selfie'] = {
+                        'status': 'captured',
+                        'image_data': data['selfie_base64'],
+                        'captured_at': datetime.utcnow().isoformat()
+                    }
+                elif 'photo_base64' in data and 'photo' not in information_types:
+                    # Fallback: if only photo_base64 is sent and photo is not requested, use it for selfie
+                    user_data['selfie'] = {
                         'status': 'captured',
                         'image_data': data['photo_base64'],
                         'captured_at': datetime.utcnow().isoformat()
                     }
                 else:
-                    user_data[info_type] = {
+                    user_data['selfie'] = {
+                        'status': 'not_captured',
+                        'image_data': None
+                    }
+            elif info_type == 'photo':
+                if 'photo_base64' in data:
+                    user_data['photo'] = {
+                        'status': 'captured',
+                        'image_data': data['photo_base64'],
+                        'captured_at': datetime.utcnow().isoformat()
+                    }
+                else:
+                    user_data['photo'] = {
                         'status': 'not_captured',
                         'image_data': None
                     }
@@ -407,6 +503,8 @@ def submit_verification_response(current_user_id):
         db.session.commit()
         
         current_app.logger.info(f"✅ Verification response submitted: Request {request_id} by user {current_user_id}")
+        current_app.logger.info(f"👁 Views allowed: {views_allowed}")
+        current_app.logger.info(f"📍 Location included: {'location' in user_data}")
         
         return {
             'message': 'Verification response submitted successfully',
@@ -422,6 +520,16 @@ def submit_verification_response(current_user_id):
 @keys_bp.route('/keys/<int:key_id>/details', methods=['GET'])
 @token_required
 def get_key_details(current_user_id, key_id):
+    """Get key details - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("60 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '60 requests per minute allowed'}, 429
+    
     try:
         key = ShareableKey.query.filter(
             db.and_(
@@ -436,38 +544,48 @@ def get_key_details(current_user_id, key_id):
         if not key:
             return {'error': 'Key not found or access denied'}, 404
         
-        if (key.recipient_user_id == current_user_id and 
-            key.status == 'viewed_out' and 
-            key.views_used >= key.views_allowed):
-            return {
-                'key_details': {
-                    'id': key.id,
-                    'label': key.label,
-                    'status': 'viewed_out',
-                    'views_used': key.views_used,
-                    'views_allowed': key.views_allowed,
-                    'error': 'You have exhausted all allowed views for this key'
-                }
-            }, 403
-        
-        if key.recipient_user_id == current_user_id and key.status == 'active':
-            key.views_used += 1
-            key.last_viewed_at = datetime.utcnow()
+        # Check if viewing is allowed for unlimited views (999)
+        if key.recipient_user_id == current_user_id:
+            if key.views_allowed != 999 and key.status == 'viewed_out' and key.views_used >= key.views_allowed:
+                return {
+                    'key_details': {
+                        'id': key.id,
+                        'label': key.label,
+                        'status': 'viewed_out',
+                        'views_used': key.views_used,
+                        'views_allowed': key.views_allowed,
+                        'error': 'You have exhausted all allowed views for this key'
+                    }
+                }, 403
             
-            if key.views_used >= key.views_allowed:
-                key.status = 'viewed_out'
-                current_app.logger.info(f"🔄 Key {key_id} moved to viewed_out status")
-            
-            db.session.commit()
-            current_app.logger.info(f"👁 View counted for key {key_id}: {key.views_used}/{key.views_allowed}")
+            # Increment view count only if recipient and not unlimited
+            if key.recipient_user_id == current_user_id and key.status == 'active':
+                if key.views_allowed != 999:  # Don't increment for unlimited views
+                    key.views_used += 1
+                    key.last_viewed_at = datetime.utcnow()
+                    
+                    if key.views_used >= key.views_allowed:
+                        key.status = 'viewed_out'
+                        current_app.logger.info(f"🔄 Key {key_id} moved to viewed_out status")
+                else:
+                    # For unlimited views, just update last viewed
+                    key.last_viewed_at = datetime.utcnow()
+                
+                db.session.commit()
+                current_app.logger.info(f"👁 View recorded for key {key_id}: {key.views_used}/{key.views_allowed if key.views_allowed != 999 else 'unlimited'}")
         
         creator = User.query.get(key.creator_id)
         recipient = User.query.get(key.recipient_user_id) if key.recipient_user_id else None
         
         user_data = key.get_user_data()
+        
+        # Ensure location data is properly formatted
         if user_data and 'location' in user_data and isinstance(user_data['location'], dict):
+            location_data = user_data['location']
             user_data['location'] = {
-                'cityDisplay': user_data['location'].get('cityDisplay', 'Location shared')
+                'cityDisplay': location_data.get('cityDisplay', 'Location shared'),
+                'latitude': location_data.get('latitude'),
+                'longitude': location_data.get('longitude')
             }
         
         key_details = {
@@ -479,7 +597,7 @@ def get_key_details(current_user_id, key_id):
             'user_data': user_data,
             'views_used': key.views_used,
             'views_allowed': key.views_allowed,
-            'views_remaining': max(0, key.views_allowed - key.views_used),
+            'views_remaining': 'Unlimited' if key.views_allowed == 999 else max(0, key.views_allowed - key.views_used),
             'is_shareable_link': key.is_shareable_link,
             'notes': key.notes,
             'created_at': key.created_at.isoformat() if key.created_at else None,
@@ -509,6 +627,16 @@ def get_key_details(current_user_id, key_id):
 @keys_bp.route('/keys/<int:key_id>/revoke', methods=['POST'])
 @token_required
 def revoke_key(current_user_id, key_id):
+    """Revoke a key - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 operations per hour allowed'}, 429
+    
     try:
         key = ShareableKey.query.filter_by(
             id=key_id,
@@ -538,6 +666,16 @@ def revoke_key(current_user_id, key_id):
 @keys_bp.route('/keys/<int:key_id>', methods=['DELETE'])
 @token_required
 def delete_key(current_user_id, key_id):
+    """Delete a key - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 operations per hour allowed'}, 429
+    
     try:
         sent_key = ShareableKey.query.filter_by(
             id=key_id,
@@ -551,6 +689,7 @@ def delete_key(current_user_id, key_id):
             db.session.delete(sent_key)
             db.session.commit()
             current_app.logger.info(f"✅ Sent key deleted: {key_id}")
+            
             return {
                 'message': 'Key deleted successfully'
             }, 200
@@ -564,6 +703,7 @@ def delete_key(current_user_id, key_id):
             db.session.delete(received_key)
             db.session.commit()
             current_app.logger.info(f"✅ Received key deleted: {key_id}")
+            
             return {
                 'message': 'Key deleted successfully'
             }, 200
@@ -578,6 +718,16 @@ def delete_key(current_user_id, key_id):
 @keys_bp.route('/keys/new-count', methods=['GET'])
 @token_required
 def get_new_keys_count(current_user_id):
+    """Get count of new keys - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("60 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '60 requests per minute allowed'}, 429
+    
     try:
         new_keys_count = ShareableKey.query.filter_by(
             recipient_user_id=current_user_id,
@@ -596,6 +746,16 @@ def get_new_keys_count(current_user_id):
 @keys_bp.route('/keys/<int:key_id>/remove', methods=['POST'])
 @token_required
 def remove_received_key(current_user_id, key_id):
+    """Remove a received key - Rate limited"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per hour")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '30 operations per hour allowed'}, 429
+    
     try:
         key = ShareableKey.query.filter_by(
             id=key_id,

@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timedelta, timezone, date
 from verikey.models import db
 from verikey.models import User
+from verikey.models_auth import RefreshToken
 from verikey.decorators import token_required
 
 auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
@@ -36,28 +37,53 @@ def validate_screen_name(screen_name):
     
     return True, clean_name
 
-def generate_jwt_token(user_id):
+def generate_tokens(user_id, device_info=None):
+    """Generate both access and refresh tokens"""
     try:
-        payload = {
+        # Generate access token (short-lived)
+        access_payload = {
             'user_id': user_id,
-            'exp': datetime.now(timezone.utc) + timedelta(hours=current_app.config['JWT_EXPIRATION_HOURS']),
+            'type': 'access',
+            'exp': datetime.now(timezone.utc) + timedelta(seconds=current_app.config['JWT_ACCESS_TOKEN_EXPIRES']),
             'iat': datetime.now(timezone.utc)
         }
-        token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
-        return token
+        access_token = jwt.encode(access_payload, current_app.config['SECRET_KEY'], algorithm='HS256')
+        
+        # Generate refresh token (long-lived) - stored in database
+        refresh_token = RefreshToken.create_token(
+            user_id=user_id,
+            device_info=device_info,
+            expires_in_seconds=current_app.config['JWT_REFRESH_TOKEN_EXPIRES']
+        )
+        
+        return {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'expires_in': current_app.config['JWT_ACCESS_TOKEN_EXPIRES']
+        }
     except Exception as e:
-        current_app.logger.error(f"JWT token generation failed: {str(e)}")
+        current_app.logger.error(f"Token generation failed: {str(e)}")
         return None
 
 @auth_bp.route('/signup', methods=['POST'])
 def signup():
+    """Rate limited signup endpoint"""
+    # Apply rate limiting using decorator from app's limiter
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        # Decorate this function dynamically
+        limited = limiter.limit("5 per hour")(lambda: None)
+        try:
+            limited()
+        except Exception as e:
+            return {'error': 'Rate limit exceeded', 'message': '5 signups per hour allowed'}, 429
+    
     try:
         if not request.is_json:
             current_app.logger.warning("Signup attempt without JSON data")
             return {'error': 'Request must be JSON'}, 400
         
         data = request.get_json()
-        
         if not data:
             return {'error': 'No data provided'}, 400
         
@@ -119,7 +145,6 @@ def signup():
                     errors.append('You must be at least 18 years old to use Verikey')
                 elif age > 120:
                     errors.append('Please enter a valid date of birth')
-                    
             except (ValueError, TypeError):
                 errors.append('Invalid date of birth format. Please use MM/DD/YYYY')
         
@@ -133,7 +158,8 @@ def signup():
             if existing_email:
                 db.session.rollback()
                 current_app.logger.warning(f"Signup attempt with existing email: {email}")
-                return {'error': 'An account with this email already exists'}, 409
+                # Don't reveal that email exists
+                return {'error': 'Registration failed. Please try with different credentials.'}, 409
             
             existing_screen_name = User.query.filter_by(screen_name=screen_name, is_active=True).first()
             if existing_screen_name:
@@ -160,8 +186,10 @@ def signup():
             db.session.add(new_user)
             db.session.commit()
             
-            token = generate_jwt_token(new_user.id)
-            if not token:
+            # Generate tokens
+            device_info = request.headers.get('User-Agent', 'Unknown')
+            tokens = generate_tokens(new_user.id, device_info)
+            if not tokens:
                 current_app.logger.error(f"User {new_user.id} created but token generation failed")
                 return {'error': 'Account created but login failed. Please try logging in.'}, 500
             
@@ -169,7 +197,9 @@ def signup():
             
             return {
                 'message': 'Account created successfully',
-                'token': token,
+                'access_token': tokens['access_token'],
+                'refresh_token': tokens['refresh_token'],
+                'expires_in': tokens['expires_in'],
                 'user': new_user.to_dict()
             }, 201
             
@@ -183,6 +213,15 @@ def signup():
 
 @auth_bp.route('/check-username', methods=['POST'])
 def check_username():
+    """Rate limited username check"""
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded'}, 429
+    
     try:
         data = request.get_json()
         screen_name = data.get('screen_name', '').strip()
@@ -207,13 +246,22 @@ def check_username():
 
 @auth_bp.route('/login', methods=['POST'])
 def login():
+    """Rate limited login endpoint"""
+    # Apply rate limiting
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("5 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded', 'message': '5 login attempts per minute allowed'}, 429
+    
     try:
         if not request.is_json:
             current_app.logger.warning("Login attempt without JSON data")
             return {'error': 'Request must be JSON'}, 400
         
         data = request.get_json()
-        
         if not data:
             return {'error': 'No data provided'}, 400
         
@@ -257,8 +305,10 @@ def login():
         
         try:
             if bcrypt.checkpw(password.encode('utf-8'), user.password.encode('utf-8')):
-                token = generate_jwt_token(user.id)
-                if not token:
+                # Generate tokens
+                device_info = request.headers.get('User-Agent', 'Unknown')
+                tokens = generate_tokens(user.id, device_info)
+                if not tokens:
                     current_app.logger.error(f"Login successful but token generation failed for user {user.id}")
                     return {'error': 'Login processing failed. Please try again.'}, 500
                 
@@ -269,12 +319,15 @@ def login():
                 
                 return {
                     'message': 'Login successful',
-                    'token': token,
+                    'access_token': tokens['access_token'],
+                    'refresh_token': tokens['refresh_token'],
+                    'expires_in': tokens['expires_in'],
                     'user': user.to_dict()
                 }, 200
             else:
                 current_app.logger.warning(f"Login attempt with wrong password for: {login_identifier}")
                 return {'error': 'Invalid email/username or password'}, 401
+                
         except Exception as e:
             current_app.logger.error(f"Password verification error: {str(e)}")
             return {'error': 'Login processing failed. Please try again.'}, 500
@@ -283,17 +336,79 @@ def login():
         current_app.logger.error(f"Login error: {str(e)}")
         return {'error': 'Login failed. Please try again.'}, 500
 
+@auth_bp.route('/refresh', methods=['POST'])
+def refresh_token():
+    """New secure refresh token endpoint"""
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("10 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded'}, 429
+    
+    try:
+        data = request.get_json()
+        if not data or 'refresh_token' not in data:
+            return {'error': 'Refresh token is required'}, 400
+        
+        refresh_token_string = data['refresh_token']
+        
+        # Verify refresh token
+        user_id = RefreshToken.verify_token(refresh_token_string)
+        if not user_id:
+            current_app.logger.warning("Invalid or expired refresh token used")
+            return {'error': 'Invalid or expired refresh token'}, 401
+        
+        # Check if user still exists and is active
+        user = User.query.filter_by(id=user_id, is_active=True).first()
+        if not user:
+            current_app.logger.warning(f"Refresh token valid but user {user_id} no longer exists or is inactive")
+            RefreshToken.revoke_token(refresh_token_string)
+            return {'error': 'User no longer exists or is inactive'}, 401
+        
+        # Revoke old refresh token
+        RefreshToken.revoke_token(refresh_token_string)
+        
+        # Generate new tokens
+        device_info = request.headers.get('User-Agent', 'Unknown')
+        tokens = generate_tokens(user.id, device_info)
+        if not tokens:
+            current_app.logger.error(f"Failed to generate new tokens during refresh for user {user_id}")
+            return {'error': 'Token refresh failed'}, 500
+        
+        current_app.logger.info(f"✅ Token refreshed successfully for user {user_id}")
+        
+        return {
+            'message': 'Token refreshed successfully',
+            'access_token': tokens['access_token'],
+            'refresh_token': tokens['refresh_token'],
+            'expires_in': tokens['expires_in'],
+            'user': user.to_dict()
+        }, 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Token refresh error: {str(e)}")
+        return {'error': 'Token refresh failed'}, 500
+
 @auth_bp.route('/verify', methods=['GET'])
 @token_required
 def verify_token(current_user_id):
+    """Verify access token"""
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded'}, 429
+    
     try:
         user = User.query.filter_by(id=current_user_id, is_active=True).first()
-        
         if not user:
             return {'error': 'User not found or inactive'}, 404
         
         current_app.logger.info(f"Token verification successful for user {current_user_id}")
-        
         return {
             'message': 'Token is valid',
             'user': user.to_dict()
@@ -306,72 +421,49 @@ def verify_token(current_user_id):
 @auth_bp.route('/logout', methods=['POST'])
 @token_required
 def logout(current_user_id):
+    """Logout and revoke refresh token"""
     try:
+        data = request.get_json()
+        if data and 'refresh_token' in data:
+            # Revoke the specific refresh token
+            RefreshToken.revoke_token(data['refresh_token'])
+        
         current_app.logger.info(f"User {current_user_id} logged out")
         return {'message': 'Logout successful'}, 200
+        
     except Exception as e:
         current_app.logger.error(f"Logout error for user {current_user_id}: {str(e)}")
         return {'error': 'Logout failed'}, 500
 
-@auth_bp.route('/refresh', methods=['POST'])
-def refresh_token():
+@auth_bp.route('/logout-all', methods=['POST'])
+@token_required  
+def logout_all_devices(current_user_id):
+    """Logout from all devices by revoking all refresh tokens"""
     try:
-        token = None
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            try:
-                token = auth_header.split(' ')[1]
-            except IndexError:
-                current_app.logger.warning("Invalid Authorization header format for refresh")
-                return {'error': 'Invalid authorization header format'}, 401
+        RefreshToken.revoke_all_user_tokens(current_user_id)
         
-        if not token:
-            current_app.logger.warning("Refresh attempt without token")
-            return {'error': 'Token is required for refresh'}, 401
+        current_app.logger.info(f"User {current_user_id} logged out from all devices")
+        return {'message': 'Successfully logged out from all devices'}, 200
         
-        try:
-            data = jwt.decode(
-                token,
-                current_app.config['SECRET_KEY'],
-                algorithms=['HS256'],
-                options={"verify_exp": False}
-            )
-            current_user_id = data['user_id']
-            
-            current_user = User.query.filter_by(id=current_user_id, is_active=True).first()
-            if not current_user:
-                current_app.logger.warning(f"Refresh token valid but user {current_user_id} no longer exists or is inactive")
-                return {'error': 'User no longer exists or is inactive'}, 401
-            
-            new_token = generate_jwt_token(current_user.id)
-            if not new_token:
-                current_app.logger.error(f"Failed to generate new token during refresh for user {current_user_id}")
-                return {'error': 'Token refresh failed'}, 500
-            
-            current_app.logger.info(f"✅ Token refreshed successfully for user {current_user_id}")
-            
-            return {
-                'message': 'Token refreshed successfully',
-                'token': new_token,
-                'user': current_user.to_dict()
-            }, 200
-            
-        except jwt.InvalidTokenError as e:
-            current_app.logger.warning(f"Invalid token for refresh: {str(e)}")
-            return {'error': 'Invalid token for refresh'}, 401
-        except Exception as e:
-            current_app.logger.error(f"Token refresh validation error: {str(e)}")
-            return {'error': 'Token refresh validation failed'}, 401
-            
     except Exception as e:
-        current_app.logger.error(f"Token refresh error: {str(e)}")
-        return {'error': 'Token refresh failed'}, 500
+        current_app.logger.error(f"Logout all devices error for user {current_user_id}: {str(e)}")
+        return {'error': 'Failed to logout from all devices'}, 500
 
 @auth_bp.route('/users', methods=['GET'])
 @token_required
 def list_users(current_user_id):
+    """List all active users"""
+    if hasattr(current_app, 'limiter'):
+        limiter = current_app.limiter
+        limited = limiter.limit("30 per minute")(lambda: None)
+        try:
+            limited()
+        except:
+            return {'error': 'Rate limit exceeded'}, 429
+    
     try:
         users = User.query.filter_by(is_active=True).all()
+        
         user_list = [{
             'id': user.id,
             'email': user.email,
@@ -383,7 +475,6 @@ def list_users(current_user_id):
         } for user in users]
         
         current_app.logger.info(f"User list requested by user {current_user_id}, returning {len(user_list)} active users")
-        
         return {'users': user_list}, 200
         
     except Exception as e:
